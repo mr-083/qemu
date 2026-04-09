@@ -1,0 +1,246 @@
+name: Build QEMU with NVMe namespace hotplug
+
+on:
+  push:
+    tags:
+      - 'v*'
+  schedule:
+    # Check for upstream changes every 6 hours (only builds if changes exist)
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    outputs:
+      updated: ${{ steps.rebase.outputs.updated }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: nvme-ns-hotplug
+          fetch-depth: 0
+
+      - name: Rebase on upstream master
+        id: rebase
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://gitlab.com/qemu-project/qemu.git || true
+          git fetch upstream master
+          BEFORE=$(git rev-parse HEAD)
+          if git rebase upstream/master; then
+            AFTER=$(git rev-parse HEAD)
+            if [ "$BEFORE" = "$AFTER" ]; then
+              echo "updated=false" >> "$GITHUB_OUTPUT"
+              echo "No upstream changes, skipping build"
+            else
+              git push origin nvme-ns-hotplug --force-with-lease
+              TAG="v$(date +%Y%m%d)-nvme-hotplug"
+              git tag -f "$TAG"
+              git push origin "$TAG" --force
+              echo "updated=true" >> "$GITHUB_OUTPUT"
+              echo "Rebase successful, tagged $TAG"
+            fi
+          else
+            git rebase --abort
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Rebase conflict — manual intervention needed"
+          fi
+
+      - name: Slack — rebase conflict
+        if: steps.rebase.outputs.conflict == 'true'
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":warning: *QEMU fork rebase conflict*\nThe `nvme-ns-hotplug` branch has a conflict with upstream master.\nManual intervention needed: <https://github.com/mr-083/qemu|mr-083/qemu>"
+                  }
+                }
+              ]
+            }
+
+      - name: Slack — rebased successfully
+        if: steps.rebase.outputs.updated == 'true'
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":arrows_counterclockwise: *QEMU fork rebased*\nUpstream changes detected and rebased. New build in progress."
+                  }
+                }
+              ]
+            }
+
+  build:
+    needs: [rebase]
+    if: always() && (needs.rebase.result == 'skipped' || needs.rebase.outputs.updated == 'true')
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-softmmu
+            accel: hvf
+            artifact: qemu-system-aarch64-darwin-arm64
+            binary: qemu-system-aarch64
+          - os: ubuntu-24.04
+            target: x86_64-softmmu
+            accel: kvm
+            artifact: qemu-system-x86_64-linux-amd64
+            binary: qemu-system-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-softmmu
+            accel: kvm
+            artifact: qemu-system-aarch64-linux-arm64
+            binary: qemu-system-aarch64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: nvme-ns-hotplug
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install meson ninja pkg-config glib pixman
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential meson ninja-build \
+            pkg-config libglib2.0-dev libpixman-1-dev python3-venv
+
+      - name: Configure
+        run: |
+          mkdir build && cd build
+          ../configure \
+            --target-list=${{ matrix.target }} \
+            --enable-${{ matrix.accel }} \
+            --disable-docs \
+            --disable-gtk \
+            --disable-sdl \
+            --disable-vnc \
+            --disable-spice \
+            --disable-usb-redir \
+            --disable-guest-agent
+
+      - name: Build
+        run: |
+          cd build
+          ninja ${{ matrix.binary }}
+
+      - name: Sign (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          xattr -cr build/${{ matrix.binary }}
+          codesign -f -s - \
+            --entitlements accel/hvf/entitlements.plist \
+            build/${{ matrix.binary }}
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/${{ matrix.binary }} dist/${{ matrix.artifact }}
+          chmod +x dist/${{ matrix.artifact }}
+          if echo "${{ matrix.target }}" | grep -q aarch64; then
+            bunzip2 -k pc-bios/edk2-aarch64-code.fd.bz2 -c > dist/edk2-aarch64-code.fd
+          else
+            bunzip2 -k pc-bios/edk2-x86_64-code.fd.bz2 -c > dist/edk2-x86_64-code.fd
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          cd artifacts
+          find . -type f -name "qemu-*" -exec mv {} . \;
+          find . -type f -name "edk2-*" | sort -u | while read f; do
+            base=$(basename "$f")
+            [ -f "$base" ] || mv "$f" .
+          done
+          find . -mindepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
+          ls -la
+          sha256sum * > SHA256SUMS || true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          body: |
+            QEMU with NVMe namespace hotplug support.
+
+            Rebased on upstream QEMU master. Includes:
+            - NVMe namespace hotplug with AEN notification (hw/nvme)
+            - NVMe subsystem model support for device_del/device_add on nvme-ns
+
+            ## Binaries
+            | File | Platform |
+            |------|----------|
+            | qemu-system-aarch64-darwin-arm64 | macOS Apple Silicon (M1-M5) |
+            | qemu-system-aarch64-linux-arm64 | Linux ARM64 |
+            | qemu-system-x86_64-linux-amd64 | Linux x86_64 |
+
+            ## Usage
+            ```
+            device_del ns0
+            drive_del drv0
+            drive_add 0 file=disk.qcow2,format=qcow2,id=drv0,if=none
+            device_add nvme-ns,id=ns0,drive=drv0,bus=ctrl0,nsid=1
+            ```
+
+            ## macOS: apply HVF entitlements after download
+            ```
+            chmod +x qemu-system-*
+            codesign -f -s - --entitlements entitlements.plist qemu-system-*
+            ```
+
+      - name: Slack — release published
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":rocket: *New QEMU build released*\nTag: `${{ github.ref_name }}`\n<https://github.com/mr-083/qemu/releases/tag/${{ github.ref_name }}|Download binaries>"
+                  }
+                }
+              ]
+            }
