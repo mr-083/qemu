@@ -130,9 +130,16 @@ jobs:
       - name: Configure
         run: |
           mkdir build && cd build
-          PREFIX=${{ runner.os == 'Linux' && '/usr' || '/usr/local' }}
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            PREFIX=/usr
+            LIBEXECDIR=lib/qemu
+          else
+            PREFIX=/usr/local
+            LIBEXECDIR=libexec
+          fi
           ../configure \
             --prefix=$PREFIX \
+            --libexecdir=$LIBEXECDIR \
             --target-list=${{ matrix.target }} \
             --enable-${{ matrix.accel }} \
             --disable-docs \
